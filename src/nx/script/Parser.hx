@@ -382,7 +382,13 @@ class Parser {
 				type = parseTypeHint();
 			}
 
-			params.push({name: name, type: type});
+			// Optional default value: name:Type = expr
+			var defaultValue:Null<Expr> = null;
+			if (match(TOperator(OAssign))) {
+				defaultValue = parseExpression();
+			}
+
+			params.push({name: name, type: type, defaultValue: defaultValue});
 			skipNewlines();
 		} while (match(TComma));
 
@@ -907,6 +913,9 @@ class Parser {
 			case TKeyword(KMatch), TKeyword(KSwitch):
 				parseMatchExpression();
 
+			case TKeyword(KFunction), TKeyword(KFunc):
+				parseAnonymousFunc();
+
 			case TNumber(v):
 				advance();
 				ENumber(v);
@@ -1044,7 +1053,8 @@ class Parser {
 				expect(TKeyword(KCase), "Expected 'case' in match block");
 				if (isSwitch) {
 					var patterns = parseSwitchCasePatterns();
-					expect(TColon, 'Expected ":" after case pattern at line ${peek().line}');
+					if (!match(TColon) && !match(TFatArrow))
+						throw 'Expected ":" or "=>" after case pattern at line ${peek().line}';
 					var body = parseSwitchCaseBody();
 					for (pattern in patterns) {
 						cases.push({pattern: pattern, body: body.copy()});
@@ -1081,6 +1091,22 @@ class Parser {
 			var expr = parseExpression();
 			return ELambda(params, Left(expr));
 		}
+	}
+
+	function parseAnonymousFunc():Expr {
+		advance(); // consume 'function' or 'func'
+		// Optional function name for named anonymous functions (ignored for now)
+		if (isIdentifier()) {
+			advance();
+		}
+		expect(TLeftParen, "Expected '(' after 'function' in anonymous function");
+		var params = parseParameters();
+		expect(TRightParen, "Expected ')' after parameters");
+		skipNewlines();
+		expect(TLeftBrace, "Expected '{' before anonymous function body");
+		var body = parseBlockBody();
+		expect(TRightBrace, "Expected '}' after anonymous function body");
+		return ELambda(params, Right(body));
 	}
 
 	function parseArrayLiteral():Expr {
@@ -1159,7 +1185,8 @@ class Parser {
 
 			if (match(TKeyword(KDefault))) {
 				if (isSwitch) {
-					expect(TColon, 'Expected ":" after "default" at line ${peek().line}');
+					if (!match(TColon) && !match(TFatArrow))
+						throw 'Expected ":" or "=>" after "default" at line ${peek().line}';
 					defaultBody = parseSwitchCaseBody();
 				} else {
 					// default => body
@@ -1171,7 +1198,8 @@ class Parser {
 				expect(TKeyword(KCase), "Expected 'case' in match block");
 				if (isSwitch) {
 					var patterns = parseSwitchCasePatterns();
-					expect(TColon, 'Expected ":" after case pattern at line ${peek().line}');
+					if (!match(TColon) && !match(TFatArrow))
+						throw 'Expected ":" or "=>" after case pattern at line ${peek().line}';
 					var body = parseSwitchCaseBody();
 					for (pattern in patterns) {
 						cases.push({pattern: pattern, body: body.copy()});
