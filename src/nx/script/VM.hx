@@ -169,6 +169,7 @@ class VM {
 	var nativeObjectMethodCache:ObjectMap<Dynamic, Map<String, Value>>;
 	var classStaticMethodCache:ObjectMap<ClassData, Map<String, Value>>;
 	var instanceClassMethodCache:ObjectMap<ClassData, Map<String, Null<FunctionChunk>>>;
+	var nativeMethodCache: haxe.ds.ObjectMap<Dynamic, Map<String, Value>> = new haxe.ds.ObjectMap();
 	var nativeFieldKindCache:Map<String, Map<String, Bool>>;
 	var arrayMethodCache:ObjectMap<Dynamic, Map<String, Value>>;
 	var instanceMethodCache:ObjectMap<Dynamic, Map<String, Value>>;
@@ -1733,7 +1734,7 @@ class VM {
 
 	// Conversion between Haxe and Script values
 
-	public function haxeToValue(value:Dynamic):Value {
+	public inline function haxeToValue(value:Dynamic):Value {
 		// hxcpp guard.. dynamic can be of type bool as null !?tM
 		return switch (Type.typeof(value)) {
 			case TNull: Std.isOfType(value, Bool) ? VBool(value) : VNull;
@@ -1761,7 +1762,7 @@ class VM {
 		}
 	}
 
-	public function valueToHaxe(value:Value):Dynamic {
+	public inline function valueToHaxe(value:Value):Dynamic {
 		if (value == null)
 			return null;
 		return switch (value) {
@@ -2044,69 +2045,293 @@ class VM {
 		return null;
 	}
 
-	// Member access
+	// helper (inline = no call overhead)
+	inline function keyOf(v:Value):String {
+		return switch (v) {
+			case VString(s): s;
+			default: valueToString(v);
+		}
+	}
+
 	public function getMember(object:Value, field:String):Value {
-		return switch (object) {
+		switch (object) {
+
+
 			case VNumber(n):
-				getNumberMethod(n, field);
+				return getNumberMethod(n, field);
 
 			case VString(s):
-				getStringMethod(s, field);
+				return getStringMethod(s, field);
 
 			case VArray(arr):
-				getArrayMethod(arr, field);
+				return getArrayMethod(arr, field);
+
 
 			case VDict(map):
 				switch (field) {
-					case "keys": return VNativeFunction("keys", 0, (_) -> VArray([for (k in map.keys()) VString(k)]));
-					case "values": return VNativeFunction("values", 0, (_) -> VArray([for (k in map.keys()) map.get(k)]));
-					case "has": return VNativeFunction("has", 1, (args) -> VBool(switch (args[0]) {
-							case VString(k): map.exists(k);
-							default: map.exists(valueToString(args[0]));
-						}));
-					case "remove": return VNativeFunction("remove", 1, (args) -> {
-							var k = switch (args[0]) {
-								case VString(s): s;
-								default: valueToString(args[0]);
-							};
-							map.remove(k);
+					case "keys":
+						return VArray([for (k in map.keys()) VString(k)]);
+
+					case "values":
+						return VArray([for (k in map.keys()) map.get(k)]);
+
+					case "has":
+						return VNativeFunction("has", 1, (args) ->
+							VBool(map.exists(keyOf(args[0])))
+						);
+
+					case "remove":
+						return VNativeFunction("remove", 1, (args) -> {
+							map.remove(keyOf(args[0]));
 							return VNull;
 						});
-					case "set": return VNativeFunction("set", 2, (args) -> {
-							var k = switch (args[0]) {
-								case VString(s): s;
-								default: valueToString(args[0]);
-							};
-							map.set(k, args[1]);
+
+					case "set":
+						return VNativeFunction("set", 2, (args) -> {
+							map.set(keyOf(args[0]), args[1]);
 							return VNull;
 						});
-					case "size": return VNativeFunction("size", 0, (_) -> VNumber(Lambda.count(map)));
-					case "clear": return VNativeFunction("clear", 0, (_) -> {
+
+					case "size":
+						return VNumber(Lambda.count(map));
+
+					case "clear":
+						return VNativeFunction("clear", 0, (_) -> {
 							map.clear();
 							return VNull;
 						});
+
 					default:
-						map.exists(field) ? map.get(field) : VNull;
+						var v = map.get(field);
+						return (v != null || map.exists(field)) ? v : VNull;
 				}
 
-			case VInstance(_, _, _) | VClass(_) | VNativeObject(_):
-				memberResolver.getMember(object, field);
+			case VInstance(_, fields, classData):
+
+				// direct field lookup (fastest path)
+				var v = fields.get(field);
+				if (v != null) return v;
+
+				// method lookup (inline, no resolver)
+				var current = classData;
+				while (current != null) {
+					if (current.methods.exists(field)) {
+						var method = current.methods.get(field);
+
+						var superVal:Value = VNull;
+						if (classData.superClass != null && classes.exists(classData.superClass))
+							superVal = VClass(classes.get(classData.superClass));
+
+						return VFunction(method, [
+							"this" => object,
+							"super" => superVal
+						]);
+					}
+
+					if (current.superClass != null && classes.exists(current.superClass))
+						current = classes.get(current.superClass);
+					else
+						current = null;
+				}
+
+				// 3. native base fallback (NO recursion into full VM)
+				var nativeBase = fields.get(NATIVE_SUPER_INSTANCE_FIELD);
+				return switch (nativeBase) {
+					case VNativeObject(obj):
+											// Array fast path
+						if (Std.isOfType(obj, Array)) {
+							var arr:Array<Dynamic> = cast obj;
+
+							switch (field) {
+								case "length": return VNumber(arr.length);
+								case "push": return VNativeFunction("push", 1, (args) -> {
+									arr.push(valueToHaxe(args[0]));
+									return VNumber(arr.length);
+								});
+								case "pop": return VNativeFunction("pop", 0, (_) ->
+									arr.length == 0 ? VNull : haxeToValue(arr.pop())
+								);
+								case "shift": return VNativeFunction("shift", 0, (_) ->
+									arr.length == 0 ? VNull : haxeToValue(arr.shift())
+								);
+								case "unshift": return VNativeFunction("unshift", 1, (args) -> {
+									arr.unshift(valueToHaxe(args[0]));
+									return VNull;
+								});
+								case "first": return arr.length > 0 ? haxeToValue(arr[0]) : VNull;
+								case "last": return arr.length > 0 ? haxeToValue(arr[arr.length - 1]) : VNull;
+								case "copy": return VNativeObject(arr.copy());
+								default:
+							}
+						}
+
+						// Reflection fallback (direct, no helper)
+						var raw:Dynamic = Reflection.getField(obj, field);
+						if (raw == null) return VNull;
+
+						if (!Reflection.isFunction(raw))
+							return haxeToValue(raw);
+
+						var capturedObj = obj;
+						var capturedFn = raw;
+
+						return VNativeFunction(field, -1, (args:Array<Value>) -> {
+							var haxeArgs = [for (a in args) valueToHaxe(a)];
+							return haxeToValue(Reflection.callMethod(capturedObj, capturedFn, haxeArgs));
+						});
+					default:
+						VNull;
+				};
+
+			case VClass(classData):
+
+				var sMethod = classData.staticMethods.get(field);
+				if (sMethod != null)
+					return VFunction(sMethod, ["__class__" => object]);
+
+				if (classData.staticFields.exists(field))
+					return classData.staticFields.get(field);
+
+				if (field == "new" && classData.constructor != null) {
+					var thisVal = getVariable("this") ?? VNull;
+					return VFunction(classData.constructor, [
+						"this" => thisVal,
+						"__super_ctor__" => VBool(true)
+					]);
+				}
+
+				var method = classData.methods.get(field);
+				if (method != null) {
+					var thisVal = getVariable("this") ?? VNull;
+					return VFunction(method, ["this" => thisVal]);
+				}
+
+				return VNull;
 
 			case VEnumValue(eName, variant, vals):
 				switch (field) {
-					case "variant": return VString(variant);
-					case "name": return VString(variant);
-					case "enum": return VString(eName);
-					case "values": return VArray(vals.copy());
+					case "variant" | "name":
+						return VString(variant);
+
+					case "enum":
+						return VString(eName);
+
+					case "values":
+						return VArray(vals.copy());
+
 					default:
-						var idxStr = field;
-						if (StringTools.startsWith(idxStr, "value")) {
-							var i = Std.parseInt(idxStr.substr(5));
+						if (field.length > 5
+							&& field.charCodeAt(0) == 'v'.code
+							&& field.charCodeAt(1) == 'a'.code
+							&& field.charCodeAt(2) == 'l'.code
+							&& field.charCodeAt(3) == 'u'.code
+							&& field.charCodeAt(4) == 'e'.code) {
+
+							var i = Std.parseInt(field.substr(5));
 							if (i != null && i >= 0 && i < vals.length)
 								return vals[i];
 						}
 						return VNull;
 				}
+
+			case VArray(arr):
+				switch (field) 
+				{
+					case "length": return VNumber(arr.length);
+					case "push": return VNativeFunction("push", 1, (args) -> {
+						arr.push(valueToHaxe(args[0]));
+						return VNumber(arr.length);
+					});
+					case "pop": return VNativeFunction("pop", 0, (_) ->
+						arr.length == 0 ? VNull : haxeToValue(arr.pop())
+					);
+					case "shift": return VNativeFunction("shift", 0, (_) ->
+						arr.length == 0 ? VNull : haxeToValue(arr.shift())
+					);
+					case "unshift": return VNativeFunction("unshift", 1, (args) -> {
+						arr.unshift(valueToHaxe(args[0]));
+						return VNull;
+					});
+					case "first": return arr.length > 0 ? haxeToValue(arr[0]) : VNull;
+					case "last": return arr.length > 0 ? haxeToValue(arr[arr.length - 1]) : VNull;
+					case "copy": return VNativeObject(arr.copy());
+					default:
+				}
+
+			case VNativeObject(obj):
+		
+				// Reflection fallback (direct, no helper)
+				var raw:Dynamic = Reflection.getField(obj, field);
+				if (raw == null) return VNull;
+				
+				if (!Reflection.isFunction(raw))
+					return haxeToValue(raw);
+
+				var capturedObj = obj;
+				var capturedFn = raw;
+
+				return VNativeFunction(field, -1, (args:Array<Value>) -> {
+					var haxeArgs = [for (a in args) valueToHaxe(a)];
+					return haxeToValue(Reflection.callMethod(capturedObj, capturedFn, haxeArgs));
+				});
+
+				// Direct reflection 
+				var raw:Dynamic = Reflection.getField(obj, field);
+				if (raw == null) return VNull;
+
+				if (Reflection.isFunction(raw)) {
+
+					var methodCache = nativeMethodCache.get(obj);
+					if (methodCache != null) {
+						var cached = methodCache.get(field);
+						if (cached != null) return cached;
+					}
+
+					var capturedObj = obj;
+					var capturedFn = raw;
+
+					var fn = VNativeFunction(field, -1, (args:Array<Value>) -> {
+
+						switch (args.length) {
+							case 0:
+								return haxeToValue(Reflection.callMethod(capturedObj, capturedFn, []));
+
+							case 1:
+								return haxeToValue(
+									Reflection.callMethod(capturedObj, capturedFn, [
+										valueToHaxe(args[0])
+									])
+								);
+
+							case 2:
+								return haxeToValue(
+									Reflection.callMethod(capturedObj, capturedFn, [
+										valueToHaxe(args[0]),
+										valueToHaxe(args[1])
+									])
+								);
+
+							default:
+								var haxeArgs = new Array<Dynamic>();
+								for (a in args)
+									haxeArgs.push(valueToHaxe(a));
+
+								return haxeToValue(
+									Reflection.callMethod(capturedObj, capturedFn, haxeArgs)
+								);
+						}
+					});
+
+					if (methodCache == null) {
+						methodCache = new Map();
+						nativeMethodCache.set(obj, methodCache);
+					}
+
+					methodCache.set(field, fn);
+					return fn;
+				}
+
+				return haxeToValue(raw);
 
 			default:
 				throw 'Cannot access member $field on $object';
@@ -2117,8 +2342,24 @@ class VM {
 		switch (object) {
 			case VDict(map):
 				map.set(field, value);
-			case VInstance(_, _, _) | VClass(_) | VNativeObject(_):
-				memberResolver.setMember(object, field, value);
+			case VInstance(className, fields, classData):
+				if (fields.exists(field)) {
+					fields.set(field, value);
+				} else {
+					// Fallback to native base object when present (e.g. this.angle on Sprite)
+					var nativeBase = fields.get(NATIVE_SUPER_INSTANCE_FIELD);
+					switch (nativeBase) {
+						case VNativeObject(_):
+							setMember(nativeBase, field, value);
+						default:
+							fields.set(field, value);
+					}
+				}
+			case VClass(classData):
+				// Write to static field (creates it if needed)
+				classData.staticFields.set(field, value);
+			case VNativeObject(obj):
+				Reflection.setField(obj, field, valueToHaxe(value));
 			default:
 				throw 'Cannot set member $field';
 		}
@@ -2582,17 +2823,22 @@ class VM {
 		return globalSlotNames[id];
 	}
 
-	/** Returns/interns member ID for a field name. */
 	public function getMemberId(name:String):Int {
 		if (name == null || name == "")
 			return -1;
-		var existing = memberSlotByName.get(name);
-		if (existing != null)
-			return existing;
-		var id = memberSlotNames.length;
+
+		// fast path: check last few entries first
+		var len = memberSlotNames.length;
+		var i = len - 1;
+
+		// small reverse scan
+		while (i >= 0) {
+			if (memberSlotNames[i] == name)
+				return i;
+			i--;
+		}
 		memberSlotNames.push(name);
-		memberSlotByName.set(name, id);
-		return id;
+		return len;
 	}
 
 	/** Resolves a member name from ID, or null if out of range. */
