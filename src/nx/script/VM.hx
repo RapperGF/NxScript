@@ -1918,6 +1918,12 @@ class VM {
 				for (k in map.keys())
 					Reflection.setField(obj, k, valueToHaxe(map.get(k)));
 					obj;
+			case VFunction(funcChunk, closure):
+				// Haxe will call this with whatever args the native passes
+				Reflect.makeVarArgs((args:Array<Dynamic>) -> {
+					var scriptArgs = [for (a in args) haxeToValue(a)];
+					return valueToHaxe(callFunction(funcChunk, closure, scriptArgs));
+				});
 			default: null;
 		}
 	}
