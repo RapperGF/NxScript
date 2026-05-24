@@ -1913,6 +1913,11 @@ class VM {
 					case VNativeObject(_): NxProxy.wrapInstanceValue(value, this); // bind callbacks on native-backed script instances
 					default: null;
 				}
+			case VDict(map):
+				var obj:Dynamic = {};
+				for (k in map.keys())
+					Reflection.setField(obj, k, valueToHaxe(map.get(k)));
+					obj;
 			default: null;
 		}
 	}
